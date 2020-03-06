@@ -1,7 +1,7 @@
 import socket
 import platform
 import sys
-import websocketserver
+from lib.server import websocketserver
 from threading import Thread
 
 shutdown_bind_address = "localhost"
@@ -130,7 +130,7 @@ if __name__ == '__main__':
             # print('Using server sd port:    ', shutdown_port)
             check_server()
         else:
-            print('Usage: xterm ( commands ... )')
+            print('Usage: webxterm ( commands ... )')
             print('commands:')
             print('  run:        Start Server in the current window')
             print('  start:      Start Server in a separate window')

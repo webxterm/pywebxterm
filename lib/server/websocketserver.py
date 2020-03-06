@@ -1,5 +1,5 @@
 import os
-import shutdownserver
+from lib.server import shutdownserver
 import socket
 import socketserver
 import selectors
@@ -8,13 +8,16 @@ import logging
 import struct
 import time
 import json
-import sshclient
+from lib.ssh import sshclient
 import paramiko
-from properties import Properties
+from lib.common.properties import Properties
 from hashlib import sha1
 from base64 import b64encode
 from logging.handlers import RotatingFileHandler
 from threading import Thread
+
+from lib.common.logfilter import AccessLogFilter
+from lib.common.logfilter import DebugLogFilter
 
 shutdown_bind_address = "localhost"
 shutdown_port = 8898
@@ -58,14 +61,31 @@ PAYLOAD_LEN_EXT64 = 0x7f
 OPCODE_TEXT = 0x01
 CLOSE_CONN = 0x8
 
-log_date_fmt = '%Y-%m-%d %H:%M:%S'
-log_file_mode = 'w+'
-log_level = 'FATAL'
-log_format = '%(asctime)s - %(module)s.%(funcName)s[line:%(lineno)d] - %(levelname)s: %(message)s'
+access_log = "../logs/access.log"
+debug_log = "../logs/debug.log"
 
-access_logger = logging.getLogger(__name__)
-accessLoggerHandler = RotatingFileHandler("access.log")
-access_logger.addHandler(accessLoggerHandler)
+access_log_format = "%(remoteAddress)s - \"%(user)s\" - [%(asctime)s] - \"%(request)s\" " \
+             "- %(status)d - \"%(httpUserAgent)s\" - \"%(message)s\""
+debug_log_format = '%(asctime)s - %(module)s.%(funcName)s[line:%(lineno)d] - %(levelname)s: %(message)s'
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+accessLoggerHandler = RotatingFileHandler(access_log)
+accessLoggerHandler.setLevel(logging.INFO)
+accessLoggerHandler.setFormatter(logging.Formatter(access_log_format))
+# accessLoggerHandler.addFilter(lambda record: record.levelno == logging.INFO)
+accessLoggerHandler.addFilter(AccessLogFilter())
+
+debugLoggerHandler = RotatingFileHandler(debug_log)
+debugLoggerHandler.setLevel(logging.DEBUG)
+debugLoggerHandler.setFormatter(logging.Formatter(debug_log_format))
+# debugLoggerHandler.addFilter(lambda record: record.levelno == logging.DEBUG)
+debugLoggerHandler.addFilter(DebugLogFilter())
+
+logger.addHandler(accessLoggerHandler)
+logger.addHandler(debugLoggerHandler)
+
 
 if hasattr(os, "fork"):
     from socketserver import ForkingTCPServer
@@ -89,7 +109,7 @@ def decode_utf8(data, flag='ignore', replace_str=''):
                 result += (bytes([r]).decode(encoding='utf-8'))
                 last_except = False
             except UnicodeDecodeError as ude:
-                access_logger.warning(ude)
+                logger.debug(ude)
                 if last_except is False:
                     if flag == 'ignore':
                         result += ''
@@ -218,22 +238,44 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
         :return:
         """
         # 从请求的数据中获取 Sec-WebSocket-Key, Upgrade
+        sock = self.request  # type: socket.socket
 
         try:
             request_header = str(data, encoding='ascii')
         except UnicodeDecodeError:
-            access_logger.error('WS] handshake fail of decode error!')
+            logger.info('handshake fail of decode error!', extra={
+                "remoteAddress":  sock.getpeername()[0],
+                "user": "-",
+                "request": "-",
+                "status": 400,
+                "httpUserAgent": "-"
+            })
             self.keep_alive = False
             return
 
-        maps = Properties(separator=':', ignore_case=True).load(request_header)  # type: dict
+        request, payload = request_header.split("\r\n", 1);
+
+        maps = Properties(separator=':', ignore_case=True).load(payload)  # type: dict
+
         if maps.get("upgrade") is None:
-            access_logger.error('WS] Client tried to connect but was missing upgrade!')
+            logger.info('Client tried to connect but was missing upgrade!', extra={
+                "remoteAddress": sock.getpeername()[0],
+                "user": "-",
+                "request": request,
+                "status": 400,
+                "httpUserAgent":  maps.get("user-agent")
+            })
             self.keep_alive = False
             return
         sw_key = maps.get('sec-websocket-key')
         if sw_key is None:
-            access_logger.error('WS] Client tried to connect but was missing a key!')
+            logger.info('Client tried to connect but was missing a key!', extra={
+                "remoteAddress": sock.getpeername()[0],
+                "user": "-",
+                "request": request,
+                "status": 400,
+                "httpUserAgent": maps.get("user-agent")
+            })
             self.keep_alive = False
             return
         hash_value = sha1(sw_key.encode() + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
@@ -241,7 +283,13 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
         resp_body = HANDSHAKE_RESPONSE_HEADER.format(resp_key).encode()
         self.handshake_done = self.request.send(resp_body)
         if self.handshake_done > 0:
-            access_logger.debug('WS] handshake success...')
+            logger.info('handshake success...', extra={
+                "remoteAddress": sock.getpeername()[0],
+                "user": "-",
+                "request": request,
+                "status": 200,
+                "httpUserAgent": maps.get("user-agent")
+            })
             self.server.new_client(self)
 
     # 读取客户端传过来的数据
@@ -252,7 +300,13 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             message = self.request.recv(socket_buffer_size)
 
             if not message:
-                print("客户端已断开", self.request)
+                logger.info('client disconnect.', extra={
+                    "remoteAddress": self.request.getpeername()[0],
+                    "user": "-",
+                    "request": "-",
+                    "status": 200,
+                    "httpUserAgent": "-"
+                })
                 self.keep_alive = False
                 return
 
@@ -289,15 +343,33 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
         payload_length = b2 & PAYLOAD_LEN
 
         if not b1:
-            access_logger.error('WS] Client closed connection.')
+            logger.info('Client closed connection.', extra={
+                "remoteAddress": self.request.getpeername()[0],
+                "user": "-",
+                "request": "-",
+                "status": 200,
+                "httpUserAgent": "-"
+            })
             self.keep_alive = False
             return
         if opcode == CLOSE_CONN:
-            access_logger.error('WS] Client closed connection.')
+            logger.info('Client closed connection.', extra={
+                "remoteAddress": self.request.getpeername()[0],
+                "user": "-",
+                "request": "-",
+                "status": 200,
+                "httpUserAgent": "-"
+            })
             self.keep_alive = False
             return
         if not masked:
-            access_logger.error('WS] Client must always be masked.')
+            logger.info('Client must always be masked.', extra={
+                "remoteAddress": self.request.getpeername()[0],
+                "user": "-",
+                "request": "-",
+                "status": 200,
+                "httpUserAgent": "-"
+            })
             self.keep_alive = False
             return
 
@@ -332,7 +404,7 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             self.request.send(payload)
         except BrokenPipeError as bpe:
             # 发送失败，可能客户端已经异常断开。
-            print('BrokenPipeError: ', bpe)
+            logger.debug('BrokenPipeError: {}'.format(bpe))
             # 取消ssh-chan注册
             try:
                 self.selector.unregister(self.ssh_client.chan)
@@ -355,6 +427,7 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
         except KeyError:
             pass
         # '\x1b^exit\x07'
+        logger.debug("{} 连接已断开。按回车键重新连接... ".format(flag))
         self.queue.put((flag + '连接已断开。按回车键重新连接...\r\n').encode('utf-8'), block=queue_blocking)
         self.reg_send()
 
@@ -364,15 +437,15 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
 
         data = None
         if chan.recv_stderr_ready():
-            print('recv_stderr_ready: ', chan.recv_stderr(4096))
+            logger.debug("recv_stderr_ready: {}".format(chan.recv_stderr(4096)))
 
         elif chan.recv_ready():
             try:
                 data = chan.recv(channel_buffer_size)
             except socket.timeout as st:
-                print('read_channel_message', st)
+                logger.debug("read_channel_message: {}".format(st))
         elif chan.recv_exit_status():
-            print('recv_exit_status: ', chan.recv_exit_status())
+            logger.debug("recv_exit_status: {}".format(chan.recv_exit_status()))
             # 取消注册选择器，防止循环输出。
             self.resp_closed_message('\x1b^0\x07')
             chan.close()
@@ -381,9 +454,8 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             self.resp_closed_message('\x1b^1\x07')
 
         if data is not None and len(data) > 0:
-            access_logger.debug(data)
 
-            print(data)
+            logger.debug("channel data: {}".format(data))
 
             self.queue.put(data, block=queue_blocking)
             # 将事件类型改成selectors.EVENT_WRITE
@@ -405,6 +477,7 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
                 # 当read_channel_message取消注册后，再次取消注册会抛出错误
                 pass
 
+            logger.debug("正在重新连接...")
             self.queue.put('正在重新连接...\r\n\r\n'.encode('utf-8'), block=queue_blocking)
             self.reg_send()
 
@@ -415,7 +488,6 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             return
 
         if chan.send_ready():
-            access_logger.debug(cmd)
             chan.send(cmd)
             self.heartbeat_time = time.time()
         else:
@@ -426,7 +498,13 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
 
     # shutdown请求
     def shutdown_request(self):
-        access_logger.info('SD_SERVER] shutdown request...')
+        logger.info('shutdown request...', extra={
+            "remoteAddress": self.request.getpeername()[0],
+            "user": "-",
+            "request": "-",
+            "status": 200,
+            "httpUserAgent": "-"
+        })
         self.keep_alive = False
         try:
             ssh = self.ssh_client.ssh  # type: paramiko.SSHClient
@@ -494,15 +572,15 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
                 self.connect_terminal(user_data)
                 return
             if 'size' in user_data:
-                access_logger.debug('size:', user_data)
 
                 size = user_data.get('size')
-                width = user_data.get('w', 80)
-                height = user_data.get('h', 24)
-                access_logger.debug('size: w{},h{}'.format(width, height))
+                width = size.get('w', 80)
+                height = size.get('h', 24)
 
                 if self.ssh_client.chan is not None:
                     self.ssh_client.chan.resize_pty(width=width, height=height)
+
+                logger.debug("update size: width:{}, height:{}".format(width, height))
 
             if 'cmd' in user_data:
                 cmd = user_data.get('cmd')
@@ -534,11 +612,11 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
         :param message: dict
         """
         target = message.get('target')  # type: dict
-        access_logger.debug(self.request.getpeername())
-        access_logger.debug(message)
+        logger.debug(self.request.getpeername())
+        logger.debug(message)
 
         if target is None:
-            access_logger.error('无效的主机信息！！！')
+            logger.debug('无效的主机信息！！！')
         else:
             # 连接终端
             size = message.get('size')
