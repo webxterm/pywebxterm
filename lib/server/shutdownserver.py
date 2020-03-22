@@ -20,7 +20,7 @@ class ShutdownRequestHandler(socketserver.BaseRequestHandler):
     def shutdown(self):
         self.server.shutdown()
         # 发出shutdown的命令
-        http = self.server.http  # type: BkXtermServer
+        http = self.server.http  # type: WebSocketServer
         http.shutdown()
 
     def handle(self):

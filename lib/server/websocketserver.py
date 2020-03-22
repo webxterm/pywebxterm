@@ -1,23 +1,29 @@
 import os
-from lib.server import shutdownserver
 import socket
 import socketserver
 import selectors
 import queue
-import logging
-import struct
 import time
 import json
-from lib.ssh import sshclient
 import paramiko
-from lib.common.properties import Properties
-from hashlib import sha1
-from base64 import b64encode
-from logging.handlers import RotatingFileHandler
+
 from threading import Thread
+
+from lib.common.properties import Properties
+from lib.common.handshake import handshake
+from lib.common.message import Message
+from lib.common.message import pack_message
+from lib.ssh import sshclient
+from lib.common.strings import decode_utf8
+from lib.server import shutdownserver
+from lib.common.iputils import get_real_ip
+
+import logging
+from logging.handlers import RotatingFileHandler
 
 from lib.common.logfilter import AccessLogFilter
 from lib.common.logfilter import DebugLogFilter
+from lib.common.logfilter import ErrorLogFilter
 
 shutdown_bind_address = "localhost"
 shutdown_port = 8898
@@ -28,45 +34,14 @@ channel_buffer_size = 131072
 # 队列是否阻塞，False：否，True：是
 queue_blocking = False
 
-HANDSHAKE_RESPONSE_HEADER = \
-    'HTTP/1.1 101 Switching Protocols\r\n' \
-    'Connection: Upgrade\r\n' \
-    'Upgrade: websocket\r\n' \
-    'Sec-WebSocket-Accept: {0}\r\n' \
-    'WebSocket-Protocal: chat\r\n' \
-    '\r\n'
-
-'''
-+-+-+-+-+-------+-+-------------+-------------------------------+
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-------+-+-------------+-------------------------------+
-|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
-|I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
-|N|V|V|V|       |S|             |   (if payload len==126/127)   |
-| |1|2|3|       |K|             |                               |
-+-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
-|     Extended payload length continued, if payload len == 127  |
-+ - - - - - - - - - - - - - - - +-------------------------------+
-|                     Payload Data continued ...                |
-+---------------------------------------------------------------+
-'''
-FIN = 0x80
-OPCODE = 0x0f
-MASKED = 0x80
-PAYLOAD_LEN = 0x7f
-PAYLOAD_LEN_EXT16 = 0x7e
-PAYLOAD_LEN_EXT64 = 0x7f
-
-OPCODE_TEXT = 0x01
-CLOSE_CONN = 0x8
-
 access_log = "../logs/access.log"
 debug_log = "../logs/debug.log"
+error_log = "../logs/error.log"
 
 access_log_format = "%(remoteAddress)s - \"%(user)s\" - [%(asctime)s] - \"%(request)s\" " \
-             "- %(status)d - \"%(httpUserAgent)s\" - \"%(message)s\""
+                    "- %(status)d - \"%(httpUserAgent)s\" - \"%(message)s\""
 debug_log_format = '%(asctime)s - %(module)s.%(funcName)s[line:%(lineno)d] - %(levelname)s: %(message)s'
+error_log_format = '%(asctime)s - %(module)s.%(funcName)s[line:%(lineno)d] - %(levelname)s: %(message)s'
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -83,8 +58,15 @@ debugLoggerHandler.setFormatter(logging.Formatter(debug_log_format))
 # debugLoggerHandler.addFilter(lambda record: record.levelno == logging.DEBUG)
 debugLoggerHandler.addFilter(DebugLogFilter())
 
+
+errorLoggerHandler = RotatingFileHandler(debug_log)
+errorLoggerHandler.setLevel(logging.DEBUG)
+errorLoggerHandler.setFormatter(logging.Formatter(debug_log_format))
+errorLoggerHandler.addFilter(ErrorLogFilter())
+
 logger.addHandler(accessLoggerHandler)
 logger.addHandler(debugLoggerHandler)
+logger.addHandler(errorLoggerHandler)
 
 
 if hasattr(os, "fork"):
@@ -95,67 +77,6 @@ else:
     from socketserver import ThreadingTCPServer
 
     _TCPServer = ThreadingTCPServer
-
-
-# 将bytes数据转字符串
-def decode_utf8(data, flag='ignore', replace_str=''):
-    try:
-        return data.decode(encoding='utf-8')
-    except UnicodeDecodeError:
-        result = ''
-        last_except = False
-        for r in iter(data):
-            try:
-                result += (bytes([r]).decode(encoding='utf-8'))
-                last_except = False
-            except UnicodeDecodeError as ude:
-                logger.debug(ude)
-                if last_except is False:
-                    if flag == 'ignore':
-                        result += ''
-                    elif flag == 'replace':
-                        result += replace_str
-                    last_except = True
-
-        return result
-
-
-# 打包消息
-# 参考：https://www.cnblogs.com/ssyfj/p/9245150.html
-def pack_message(message):
-    # 参考 websocket-server模块(pip3 install websocket-server)
-    """
-    :param message: str
-    :return: bytes
-    """
-    if isinstance(message, bytes):
-        try:
-            message = message.decode('utf-8')
-        except UnicodeDecodeError:
-            print('Can\'t send message, message is not valid UTF-8!')
-            return
-    elif isinstance(message, str):
-        pass
-    else:
-        message = str(message)
-
-    header = bytearray()
-    header.append(FIN | OPCODE_TEXT)
-
-    payload = message.encode(encoding='utf-8')
-    payload_length = len(payload)
-    if payload_length <= 125:
-        header.append(payload_length)
-    elif 126 <= payload_length <= 65535:
-        header.append(PAYLOAD_LEN_EXT16)
-        header.extend(struct.pack('>H', payload_length))
-    elif payload_length < 18446744073709551616:
-        header.append(PAYLOAD_LEN_EXT64)
-        header.extend(struct.pack('>Q', payload_length))
-    else:
-        raise Exception("Message is too big. Consider breaking it into chunks.")
-
-    return header + payload
 
 
 # web socket 服务器
@@ -185,7 +106,7 @@ class WebSocketServer(_TCPServer):
     def shutdown_client(self, shutdown_handler):
         self.id_counter -= 1
         for client in self.clients:
-            handler = client['handler']  # type: WebSocketRequestHandler
+            handler = client['handler']  # type: WebSocketServerRequestHandler
             if handler == shutdown_handler:
                 self.clients.remove(client)
                 break
@@ -199,7 +120,7 @@ class WebSocketServer(_TCPServer):
 
     def shutdown(self):
         for client in self.clients:
-            handler = client['handler']  # type: WebSocketRequestHandler
+            handler = client['handler']  # type: WebSocketServerRequestHandler
             handler.shutdown_request()
         super().shutdown()
 
@@ -220,173 +141,92 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
         self.selector.register(request, selectors.EVENT_READ)
         self.reg_selector = None
         self.heartbeat_time = None
-        self.read_pos = 0  # 读取到那个位置
+        self.message = Message()
         self.queue = queue.Queue()  # 消息队列，主要用于ssh服务器返回的数据缓冲。
         super().__init__(request, client_address, server)
 
+    # 注册从客户端中接收
     def reg_read(self):
         self.selector.modify(self.request, selectors.EVENT_READ)
 
+    # 注册发送给客户端
     def reg_send(self):
         self.selector.modify(self.request, selectors.EVENT_WRITE)
 
     # 和客户端握手
     # 参考：https://www.cnblogs.com/ssyfj/p/9245150.html
-    def handshake(self, data):
+    def handshake(self, request_header):
         """
-        :param data: bytes
+        :param request_header: str
         :return:
         """
         # 从请求的数据中获取 Sec-WebSocket-Key, Upgrade
         sock = self.request  # type: socket.socket
 
-        try:
-            request_header = str(data, encoding='ascii')
-        except UnicodeDecodeError:
-            logger.info('handshake fail of decode error!', extra={
-                "remoteAddress":  sock.getpeername()[0],
-                "user": "-",
-                "request": "-",
-                "status": 400,
-                "httpUserAgent": "-"
-            })
-            self.keep_alive = False
-            return
-
-        request, payload = request_header.split("\r\n", 1);
+        request, payload = request_header.split("\r\n", 1)
 
         maps = Properties(separator=':', ignore_case=True).load(payload)  # type: dict
 
-        if maps.get("upgrade") is None:
-            logger.info('Client tried to connect but was missing upgrade!', extra={
-                "remoteAddress": sock.getpeername()[0],
-                "user": "-",
-                "request": request,
-                "status": 400,
-                "httpUserAgent":  maps.get("user-agent")
-            })
-            self.keep_alive = False
-            return
-        sw_key = maps.get('sec-websocket-key')
-        if sw_key is None:
-            logger.info('Client tried to connect but was missing a key!', extra={
-                "remoteAddress": sock.getpeername()[0],
-                "user": "-",
-                "request": request,
-                "status": 400,
-                "httpUserAgent": maps.get("user-agent")
-            })
-            self.keep_alive = False
-            return
-        hash_value = sha1(sw_key.encode() + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
-        resp_key = b64encode(hash_value.digest()).strip().decode('ascii')
-        resp_body = HANDSHAKE_RESPONSE_HEADER.format(resp_key).encode()
-        self.handshake_done = self.request.send(resp_body)
-        if self.handshake_done > 0:
-            logger.info('handshake success...', extra={
-                "remoteAddress": sock.getpeername()[0],
-                "user": "-",
-                "request": request,
-                "status": 200,
-                "httpUserAgent": maps.get("user-agent")
-            })
-            self.server.new_client(self)
+        try:
+            self.handshake_done = handshake(self.request, maps)
+
+            if self.handshake_done > 0:
+                self.server.new_client(self)
+
+                ip = get_real_ip(maps)
+                if not ip or ip == "unknown":
+                    ip = sock.getpeername()[0]
+
+                logger.info('handshake success...', extra={
+                    "remoteAddress": ip,
+                    "user": "-",
+                    "request": request,
+                    "status": 200,
+                    "httpUserAgent": maps.get("user-agent")
+                })
+
+            else:
+                self.keep_alive = False
+
+        except ValueError as ve:
+            logger.error(ve)
 
     # 读取客户端传过来的数据
     def read_message(self):
         try:
-
             # 客户端
             message = self.request.recv(socket_buffer_size)
 
             if not message:
-                logger.info('client disconnect.', extra={
-                    "remoteAddress": self.request.getpeername()[0],
-                    "user": "-",
-                    "request": "-",
-                    "status": 200,
-                    "httpUserAgent": "-"
-                })
+                logger.debug('client disconnect. received empty data!')
                 self.keep_alive = False
                 return
 
-            self.read_pos = 0
-
             if self.handshake_done is False:
-                self.handshake(message)
+                try:
+                    request_header = str(message, encoding='ascii')
+                except UnicodeDecodeError as e:
+                    logger.error(e)
+                    self.keep_alive = False
+                    return
+                self.handshake(request_header)
             else:
+                self.message.reset_pos()
                 # 解析文本
                 # 在读下一个字符，看看有没有客户端两次传入，一次解析的。
-                while self.read_bytes(message, 1):
-                    self.read_pos -= 1
-                    decoded = self.unpack_message(message)
-                    self.handle_decoded(decoded)
+                while self.message.read_bytes(message, 1):
+                    self.message.backward_pos()
+                    try:
+                        decoded = self.message.unpack_message(message)
+                        self.handle_decoded(decoded)
+                    except ValueError as e:
+                        logger.error(e)
+                        self.keep_alive = False
                     # print('read next....')
 
         except (ConnectionAbortedError, ConnectionResetError, TimeoutError) as es:
-            # [Errno 54] Connection reset by peer
+            # [Errno 54] Connec tion reset by peer
             self.shutdown_request()
-
-    # 消息解包
-    # struct.pack struct.unpack
-    # https://blog.csdn.net/qq_30638831/article/details/80421019
-    # 参考：https://www.cnblogs.com/ssyfj/p/9245150.html
-    def unpack_message(self, message):
-        """
-        :param message: bytes
-        :return: str
-        """
-        b1, b2 = self.read_bytes(message, 2)
-        # fin = b1 & FIN
-        opcode = b1 & OPCODE
-        masked = b2 & MASKED
-        payload_length = b2 & PAYLOAD_LEN
-
-        if not b1:
-            logger.info('Client closed connection.', extra={
-                "remoteAddress": self.request.getpeername()[0],
-                "user": "-",
-                "request": "-",
-                "status": 200,
-                "httpUserAgent": "-"
-            })
-            self.keep_alive = False
-            return
-        if opcode == CLOSE_CONN:
-            logger.info('Client closed connection.', extra={
-                "remoteAddress": self.request.getpeername()[0],
-                "user": "-",
-                "request": "-",
-                "status": 200,
-                "httpUserAgent": "-"
-            })
-            self.keep_alive = False
-            return
-        if not masked:
-            logger.info('Client must always be masked.', extra={
-                "remoteAddress": self.request.getpeername()[0],
-                "user": "-",
-                "request": "-",
-                "status": 200,
-                "httpUserAgent": "-"
-            })
-            self.keep_alive = False
-            return
-
-        if payload_length == 126:
-            # (132,)
-            payload_length = struct.unpack('>H', self.read_bytes(message, 2))[0]
-        elif payload_length == 127:
-            # (132,)
-            payload_length = struct.unpack('>Q', self.read_bytes(message, 8))[0]
-
-        masks = self.read_bytes(message, 4)
-
-        decoded = bytearray()
-        for c in self.read_bytes(message, payload_length):
-            c ^= masks[len(decoded) % 4]
-            decoded.append(c)
-        return str(decoded, encoding='utf-8')
 
     # 向客户端写发送数据
     # 从消息队列中获取数据(self.queue)
@@ -404,7 +244,7 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             self.request.send(payload)
         except BrokenPipeError as bpe:
             # 发送失败，可能客户端已经异常断开。
-            logger.debug('BrokenPipeError: {}'.format(bpe))
+            logger.error('BrokenPipeError: {}'.format(bpe))
             # 取消ssh-chan注册
             try:
                 self.selector.unregister(self.ssh_client.chan)
@@ -492,19 +332,13 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             self.heartbeat_time = time.time()
         else:
 
-            ssh = self.ssh_client  # type: SSHClient
+            ssh = self.ssh_client  # type: ssh.SSHClient
             self.queue.put('packet_write_wait: Connection to {} port {}: Broken pipe'.format(
                 ssh.args.get('hostname'), ssh.args('port')))
 
     # shutdown请求
     def shutdown_request(self):
-        logger.info('shutdown request...', extra={
-            "remoteAddress": self.request.getpeername()[0],
-            "user": "-",
-            "request": "-",
-            "status": 200,
-            "httpUserAgent": "-"
-        })
+        logger.debug('shutdown request...')
         self.keep_alive = False
         try:
             ssh = self.ssh_client.ssh  # type: paramiko.SSHClient
@@ -516,7 +350,7 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             pass
 
         self.selector.close()
-        server = self.server  # type: BkXtermServer
+        server = self.server  # type: WebSocketServer
         server.shutdown_client(self)
 
     # 处理请求
@@ -540,17 +374,6 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
                         # 从ssh通道读取数据
                         self.packet_read_wait()
 
-    # 读取字节
-    def read_bytes(self, data, num):
-        """
-        :param data: bytes
-        :param num: int
-        :return: bytes
-        """
-        bs = data[self.read_pos:num + self.read_pos]
-        self.read_pos += num
-        return bs
-
     # 处理解码后的文本
     def handle_decoded(self, decoded):
         """
@@ -565,6 +388,13 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             # except rsa.DecryptionError as de:
             #     print(de)
             #     return
+
+            if decoded == '\x1b^hello!\x1b\\':
+                # 心跳
+                logger.debug("received heartbeat!")
+                self.queue.put(b'\x1b^3;hi!\x1b\\', block=queue_blocking)
+                self.reg_send()
+                return
 
             user_data = json.loads(decoded)  # type: dict
 

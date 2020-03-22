@@ -1,2 +1,2 @@
 
-__all__ = ["logfilter", "properties"]
+__all__ = ["logfilter", "properties", "handshake", "message", "strings"]

@@ -16,3 +16,10 @@ class DebugLogFilter(logging.Filter):
             return 0
         return 1
 
+
+class ErrorLogFilter(logging.Filter):
+
+    def filter(self, record):
+        if record.levelno != logging.ERROR:
+            return 0
+        return 1

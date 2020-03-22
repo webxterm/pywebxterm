@@ -37,14 +37,19 @@ class SSHClient:
             username = self.args.get("username")
             password = self.args.get("password")
 
-            self.ssh.connect(
-                hostname=hostname,
-                port=port,
-                username=username,
-                password=password
-            )
+            transport = paramiko.Transport((hostname, port))
+            transport.handshake_timeout = 120
+            transport.connect(username=username, password=password)
+            self._transport = transport
 
-            transport = self.ssh.get_transport()  # type: paramiko.Transport
+            # self.ssh.connect(
+            #     hostname=hostname,
+            #     port=port,
+            #     username=username,
+            #     password=password
+            # )
+
+            # transport = self.ssh.get_transport()  # type: paramiko.Transport
 
             # rsa_key = paramiko.RSAKey.generate(2048)
 
