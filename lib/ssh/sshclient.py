@@ -37,10 +37,12 @@ class SSHClient:
             username = self.args.get("username")
             password = self.args.get("password")
 
+            # 修复已知问题：
+            # See: https://github.com/paramiko/paramiko/blob/2.7.1/paramiko/transport.py#L2047
             transport = paramiko.Transport((hostname, port))
             transport.handshake_timeout = 120
             transport.connect(username=username, password=password)
-            self._transport = transport
+            self.ssh._transport = transport
 
             # self.ssh.connect(
             #     hostname=hostname,
