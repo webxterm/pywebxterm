@@ -36,11 +36,13 @@ class SSHClient:
             port = self.args.get("port", 22)
             username = self.args.get("username")
             password = self.args.get("password")
+            # 握手超时时间
+            handshake_timeout = self.args.get("handshake_timeout", 120)
 
             # 修复已知问题：
-            # See: https://github.com/paramiko/paramiko/blob/2.7.1/paramiko/transport.py#L2047
+            # See: https://github.com/paramiko/paramiko/issues/1629
             transport = paramiko.Transport((hostname, port))
-            transport.handshake_timeout = 120
+            transport.handshake_timeout = handshake_timeout
             transport.connect(username=username, password=password)
             self.ssh._transport = transport
 
