@@ -18,14 +18,20 @@ def check_banner(version):
 # SSH客户端
 class SSHClient:
 
-    # heartbeat 心跳时间(s)
     def __init__(self, args=None, heartbeat=30):
+        """
+
+        :param args:
+        :param heartbeat: 心跳时间
+        """
         self.ssh = paramiko.SSHClient()
         self.ssh.load_system_host_keys()
         self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy)
+
         self.heartbeat = heartbeat
         self.chan = None
         self.args = args  # type: dict
+        self.connected = False
 
     # 连接终端
     def connect(self):
@@ -36,36 +42,33 @@ class SSHClient:
             port = self.args.get("port", 22)
             username = self.args.get("username")
             password = self.args.get("password")
-            # 握手超时时间
+
+            if not hostname:
+                error_msg = {'status': 'fail',
+                             'e': 'HostName',
+                             'zh_msg': '无效的主机名',
+                             'en_msg': 'invalid hostname!'}
+                return error_msg
+
+            if not username:
+                error_msg = {'status': 'fail',
+                             'e': 'UserName',
+                             'zh_msg': '无效的用户名',
+                             'en_msg': 'invalid username!'}
+                return error_msg
+
+            """更改握手超时时间，避免握手超过15秒抛出EOFError"""
             handshake_timeout = self.args.get("handshake_timeout", 120)
 
-            # 修复已知问题：
-            # See: https://github.com/paramiko/paramiko/issues/1629
+            """
+            修复已知问题：
+            See: https://github.com/paramiko/paramiko/issues/1629
+            """
             transport = paramiko.Transport((hostname, port))
             transport.handshake_timeout = handshake_timeout
             transport.connect(username=username, password=password)
             self.ssh._transport = transport
-
-            # self.ssh.connect(
-            #     hostname=hostname,
-            #     port=port,
-            #     username=username,
-            #     password=password
-            # )
-
-            # transport = self.ssh.get_transport()  # type: paramiko.Transport
-
-            # rsa_key = paramiko.RSAKey.generate(2048)
-
-            # print(rsa_key.key)
-
-            # transport.add_server_key(rsa_key)
-            # print(transport.get_server_key())
-
-            # stdin, stdout, stderr = self.ssh.exec_command('export LANG=zh_CN.UTF-8')
-            # stdin, stdout, stderr = self.ssh.exec_command('date', environment={'LANG': 'zh_CN.UTF-8'})
-            #
-            # print(stdout.read())
+            self.connected = True
 
         except paramiko.BadHostKeyException:
             error_msg = {'status': 'fail',
@@ -80,7 +83,7 @@ class SSHClient:
         except paramiko.SSHException:
             error_msg = {'status': 'fail',
                          'e': 'SSH',
-                         'zh_msg': '连接或建立会话时出现其他错误',
+                         'zh_msg': '连接或建立会话时出现其他错误，请检查主机名或端口。',
                          'en_msg': 'there was any other error connecting or establishing an SSH session'}
         except socket.error:
             error_msg = {'e': 'socket.error',

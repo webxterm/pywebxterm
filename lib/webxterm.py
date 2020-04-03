@@ -13,7 +13,7 @@ shutdown_command = b"\x1b[^shutdown\x1b\\"
 check_health_command = b'\x1b[^Hello\x1b\\'
 reply_health_command = b'\x1b[^Hi\x1b\\'
 
-__author__ = 'lbk <baikai.liao@qq.com>'
+__author__ = 'liaobaikai <baikai.liao@qq.com>'
 __version__ = '0.3'
 __status__ = "production"
 __date__ = "2019-11-18(created) -> 2020-02-10(updated)"

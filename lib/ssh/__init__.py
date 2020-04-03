@@ -1,2 +1,1 @@
-
-__all__ = ["sshclient"]
+__all__ = ["sshclient", "sftp"]

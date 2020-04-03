@@ -1,5 +1,6 @@
 import struct
-
+import socket
+import queue
 '''
 +-+-+-+-+-------+-+-------------+-------------------------------+
  0                   1                   2                   3
@@ -22,33 +23,54 @@ PAYLOAD_LEN = 0x7f
 PAYLOAD_LEN_EXT16 = 0x7e
 PAYLOAD_LEN_EXT64 = 0x7f
 
-OPCODE_TEXT = 0x01
-CLOSE_CONN = 0x8
 
+# https://datatracker.ietf.org/doc/rfc6455/?include_text=1
+"""Continuation Frame, 连续帧"""
+OPCODE_CONTINUATION = 0x00
+"""Text Frame，文本帧"""
+OPCODE_TEXT = 0x01
+"""Binary Frame，二进制帧"""
+OPCODE_BINARY = 0x02
+"""Connection Close Frame，链接关闭帧"""
+CLOSE_CONN = 0x8
+"""Ping Frame，ping帧（心跳发起）"""
+OPCODE_PING = 0x9
+"""Pong Frame，pong帧（心跳回应）"""
+OPCODE_PONG = 0xA
+
+
+# https://blog.csdn.net/yangzai187/article/details/93905594
 
 # 打包消息
 # 参考：https://www.cnblogs.com/ssyfj/p/9245150.html
-def pack_message(message):
+def pack_message(data, opcode=OPCODE_TEXT):
     # 参考 websocket-server模块(pip3 install websocket-server)
     """
-    :param message: str
+    :param data: 需要打包的数据
+    :param opcode:  打包类型：OPCODE_TEXT：文本，OPCODE_BINARY：二进制
     :return: bytes
     """
-    if isinstance(message, bytes):
-        try:
-            message = message.decode('utf-8')
-        except UnicodeDecodeError:
-            print('Can\'t send message, message is not valid UTF-8!')
-            return
-    elif isinstance(message, str):
-        pass
+    if opcode == OPCODE_TEXT:
+        # 文本
+        if isinstance(data, bytes):
+            try:
+                msg = data.decode('utf-8')
+            except UnicodeDecodeError:
+                print('Can\'t send message, message is not valid UTF-8!')
+                return
+        elif isinstance(data, str):
+            msg = data
+        else:
+            msg = str(data)
+
+        payload = msg.encode(encoding='utf-8')
+
     else:
-        message = str(message)
+        payload = data
 
     header = bytearray()
-    header.append(FIN | OPCODE_TEXT)
+    header.append(FIN | opcode)
 
-    payload = message.encode(encoding='utf-8')
     payload_length = len(payload)
     if payload_length <= 125:
         header.append(payload_length)
@@ -64,65 +86,32 @@ def pack_message(message):
     return header + payload
 
 
-# 客户端消息处理
-class Message:
+def unpack_message(rfile):
+    """读取消息"""
+    b1, b2 = rfile.read(2)
+    opcode = b1 & OPCODE
+    masked = b2 & MASKED
+    payload_length = b2 & PAYLOAD_LEN
 
-    def __init__(self):
-        self.read_pos = 0
+    if not b1:
+        raise ConnectionError("Client closed connection.")
+    elif opcode == CLOSE_CONN:
+        raise ConnectionError("Client asked to close connection.")
+    if not masked:
+        raise ValueError("Client must always be masked.")
 
-    def reset_pos(self):
-        if self.read_pos != 0:
-            self.read_pos = 0
+    if payload_length == 126:
+        # (132,)
+        payload_length = struct.unpack('>H', rfile.read(2))[0]
+    elif payload_length == 127:
+        # (132,)
+        payload_length = struct.unpack('>Q', rfile.read(8))[0]
 
-    def backward_pos(self):
-        self.read_pos -= 1
+    masks = rfile.read(4)
 
-    # 消息解包
-    # struct.pack struct.unpack
-    # https://blog.csdn.net/qq_30638831/article/details/80421019
-    # 参考：https://www.cnblogs.com/ssyfj/p/9245150.html
-    def unpack_message(self, message):
-        """
-        :param message: bytes
-        :return: str
-        """
-        b1, b2 = self.read_bytes(message, 2)
-        # fin = b1 & FIN
-        opcode = b1 & OPCODE
-        masked = b2 & MASKED
-        payload_length = b2 & PAYLOAD_LEN
+    decoded = bytearray()
+    for c in rfile.read(payload_length):
+        c ^= masks[len(decoded) % 4]
+        decoded.append(c)
 
-        if not b1 or opcode == CLOSE_CONN:
-            raise ValueError('Client closed connection.')
-
-        if not masked:
-            raise ValueError('Client must always be masked.')
-
-        if payload_length == 126:
-            # (132,)
-            payload_length = struct.unpack('>H', self.read_bytes(message, 2))[0]
-        elif payload_length == 127:
-            # (132,)
-            payload_length = struct.unpack('>Q', self.read_bytes(message, 8))[0]
-
-        masks = self.read_bytes(message, 4)
-
-        decoded = bytearray()
-        for c in self.read_bytes(message, payload_length):
-            c ^= masks[len(decoded) % 4]
-            decoded.append(c)
-        return str(decoded, encoding='utf-8')
-
-    # 读取字节
-    def read_bytes(self, data, num):
-        """
-        :param data: bytes
-        :param num: int
-        :return: bytes
-        """
-        bs = data[self.read_pos:num + self.read_pos]
-        self.read_pos += num
-        return bs
-
-
-
+    return opcode, decoded

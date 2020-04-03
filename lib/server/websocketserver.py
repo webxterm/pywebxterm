@@ -1,29 +1,28 @@
 import os
-import socket
 import socketserver
 import selectors
-import queue
 import time
 import json
 import paramiko
+import logging
 
 from threading import Thread
-
-from lib.common.properties import Properties
-from lib.common.handshake import handshake
-from lib.common.message import Message
-from lib.common.message import pack_message
-from lib.ssh import sshclient
-from lib.common.strings import decode_utf8
-from lib.server import shutdownserver
-from lib.common.iputils import get_real_ip
-
-import logging
 from logging.handlers import RotatingFileHandler
 
-from lib.common.logfilter import AccessLogFilter
-from lib.common.logfilter import DebugLogFilter
-from lib.common.logfilter import ErrorLogFilter
+from ..common.properties import Properties
+from ..common.handshake import handshake
+from ..common.message import *
+from ..common.strings import decode_utf8
+from ..common.iputils import get_real_ip
+
+from ..ssh.sshclient import SSHClient
+from ..ssh.sftp import SFTPClient
+
+from ..server import shutdownserver
+
+from ..common.logfilter import AccessLogFilter
+from ..common.logfilter import DebugLogFilter
+from ..common.logfilter import ErrorLogFilter
 
 shutdown_bind_address = "localhost"
 shutdown_port = 8898
@@ -58,7 +57,6 @@ debugLoggerHandler.setFormatter(logging.Formatter(debug_log_format))
 # debugLoggerHandler.addFilter(lambda record: record.levelno == logging.DEBUG)
 debugLoggerHandler.addFilter(DebugLogFilter())
 
-
 errorLoggerHandler = RotatingFileHandler(debug_log)
 errorLoggerHandler.setLevel(logging.DEBUG)
 errorLoggerHandler.setFormatter(logging.Formatter(debug_log_format))
@@ -67,7 +65,6 @@ errorLoggerHandler.addFilter(ErrorLogFilter())
 logger.addHandler(accessLoggerHandler)
 logger.addHandler(debugLoggerHandler)
 logger.addHandler(errorLoggerHandler)
-
 
 if hasattr(os, "fork"):
     from socketserver import ForkingTCPServer
@@ -88,23 +85,18 @@ class WebSocketServer(_TCPServer):
     def __init__(self, server_address, handler):
         # 连接的客户端
         self.clients = []
-        # 连接数量
-        self.id_counter = 0
         self.sd_server = shutdownserver.ShutdownServer(self, (shutdown_bind_address, shutdown_port),
                                                        shutdownserver.ShutdownRequestHandler)
         super().__init__(server_address, handler)
 
     def new_client(self, handler):
-        self.id_counter += 1
         client = {
-            'id': self.id_counter,
             'handler': handler,
             'address': handler.client_address
         }
         self.clients.append(client)
 
     def shutdown_client(self, shutdown_handler):
-        self.id_counter -= 1
         for client in self.clients:
             handler = client['handler']  # type: WebSocketServerRequestHandler
             if handler == shutdown_handler:
@@ -129,20 +121,25 @@ class WebSocketServer(_TCPServer):
         print('Server started.')
         super().serve_forever(poll_interval)
 
+    def handle_request(self):
+        print(self)
+        super().handle_request()
 
-class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
+
+class WebSocketServerRequestHandler(socketserver.StreamRequestHandler):
     def __init__(self, request, client_address, server):
         self.keep_alive = True
         self.ssh_client = None
         self.sftp_client = None
+
         self.handshake_done = False  # 是否握手成功
         self.selector = selectors.DefaultSelector()
         # 默认注册请求读取事件
         self.selector.register(request, selectors.EVENT_READ)
         self.reg_selector = None
         self.heartbeat_time = None
-        self.message = Message()
         self.queue = queue.Queue()  # 消息队列，主要用于ssh服务器返回的数据缓冲。
+
         super().__init__(request, client_address, server)
 
     # 注册从客户端中接收
@@ -155,17 +152,14 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
 
     # 和客户端握手
     # 参考：https://www.cnblogs.com/ssyfj/p/9245150.html
-    def handshake(self, request_header):
+    def handshake(self, request, maps):
         """
-        :param request_header: str
+        :param request: str
+        :param maps: dict
         :return:
         """
         # 从请求的数据中获取 Sec-WebSocket-Key, Upgrade
         sock = self.request  # type: socket.socket
-
-        request, payload = request_header.split("\r\n", 1)
-
-        maps = Properties(separator=':', ignore_case=True).load(payload)  # type: dict
 
         try:
             self.handshake_done = handshake(self.request, maps)
@@ -195,50 +189,104 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
     def read_message(self):
         try:
             # 客户端
-            message = self.request.recv(socket_buffer_size)
 
-            if not message:
-                logger.debug('client disconnect. received empty data!')
-                self.keep_alive = False
-                return
+            # data = b''
+            # while True:
+            #     chunk = self.request.recv(socket_buffer_size)
+            #     data += chunk
+            #     if len(chunk) < socket_buffer_size:
+            #         break
+
+            # if not data:
+            #     logger.debug('client disconnect. received empty data!')
+            #     self.keep_alive = False
+            #     return
 
             if self.handshake_done is False:
+
+                data = self.request.recv(1024)
+
                 try:
-                    request_header = str(message, encoding='ascii')
+                    request_header = str(data, encoding='ascii')
                 except UnicodeDecodeError as e:
                     logger.error(e)
                     self.keep_alive = False
                     return
-                self.handshake(request_header)
-            else:
-                self.message.reset_pos()
-                # 解析文本
-                # 在读下一个字符，看看有没有客户端两次传入，一次解析的。
-                while self.message.read_bytes(message, 1):
-                    self.message.backward_pos()
-                    try:
-                        decoded = self.message.unpack_message(message)
-                        self.handle_decoded(decoded)
-                    except ValueError as e:
-                        logger.error(e)
-                        self.keep_alive = False
-                    # print('read next....')
 
-        except (ConnectionAbortedError, ConnectionResetError, TimeoutError) as es:
+                request, payload = request_header.split("\r\n", 1)
+                maps = Properties(separator=':', ignore_case=True).load(payload)  # type: dict
+                self.handshake(request, maps)
+
+            else:
+                """int, bytearray"""
+                opcode = None
+                decoded = None
+                try:
+                    opcode, decoded = unpack_message(self.rfile)
+                    # opcode, decoded = self.read_next_message()
+                except (ConnectionError, ValueError) as e:
+                    self.keep_alive = False
+                    logger.error(e)
+
+                if opcode is None:
+                    pass
+                elif opcode == OPCODE_TEXT:
+                    """文本"""
+                    self.handle_decoded(str(decoded, encoding="utf-8"))
+                elif opcode == OPCODE_BINARY:
+                    """
+                    二进制数据，主要是上传文件
+                    => 从客户端传输过来的二进制包，需要直接传递给服务器端
+                    
+                    """
+
+                    def on_put_callback(transferred_bytes,
+                                        current_bytes, total_bytes, consume_seconds, remote_path, file_name):
+                        # 本次传输的字节数
+                        response_msg = {
+                            "sftp": 1,
+                            "type": "put",
+                            "path": remote_path,
+                            "name": file_name,
+                            "tx": transferred_bytes,
+                            "ctx": current_bytes,
+                            "file_size": total_bytes,
+                            "consume_seconds": "%d" % consume_seconds
+                        }
+                        self.send_message(response_msg)
+
+                    def on_finish_callback(consume_seconds, total_bytes):
+                        self.response_log_message("文件传输成功，传输了 %d 字节 (用时%d 秒)" % (total_bytes, consume_seconds))
+
+                    sftp = self.sftp_client  # type: SFTPClient
+                    sftp.put(bytes(decoded), callback=on_put_callback, finish_callback=on_finish_callback)
+                    pass
+                elif opcode == OPCODE_PING:
+                    """ping"""
+                    pass
+                elif opcode == OPCODE_PONG:
+                    """pong"""
+                    pass
+
+        except (ConnectionAbortedError, ConnectionResetError, TimeoutError):
             # [Errno 54] Connec tion reset by peer
             self.shutdown_request()
 
     # 向客户端写发送数据
     # 从消息队列中获取数据(self.queue)
-    def send_message(self):
-        message = b''
-        while not self.queue.empty():
-            message += self.queue.get_nowait()
-        # 从selection中获取数据
-        # selection_key = self.selector.get_key(self.request)
-        # message = selection_key.data
+    def send_message(self, data=None):
 
-        presentation = decode_utf8(message, flag='replace', replace_str='?')
+        if not data:
+            message = b''
+            while not self.queue.empty():
+                message += self.queue.get_nowait()
+            presentation = decode_utf8(message, flag='replace', replace_str='?')
+        else:
+            if isinstance(data, dict):
+                presentation = json.dumps(data).encode()
+            else:
+                presentation = data
+
         payload = pack_message(presentation)
         try:
             self.request.send(payload)
@@ -294,7 +342,6 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             self.resp_closed_message('\x1b^1\x07')
 
         if data is not None and len(data) > 0:
-
             logger.debug("channel data: {}".format(data))
 
             self.queue.put(data, block=queue_blocking)
@@ -309,7 +356,7 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
         :param cmd: str
         """
         chan = self.ssh_client.chan  # type: paramiko.Channel
-        if chan.closed is True:
+        if chan and chan.closed is True:
             # 取消注册ssh通道读取事件
             try:
                 self.selector.unregister(chan)
@@ -332,9 +379,9 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             self.heartbeat_time = time.time()
         else:
 
-            ssh = self.ssh_client  # type: ssh.SSHClient
+            ssh = self.ssh_client  # type: SSHClient
             self.queue.put('packet_write_wait: Connection to {} port {}: Broken pipe'.format(
-                ssh.args.get('hostname'), ssh.args('port')))
+                ssh.args.get('hostname'), ssh.args['port']))
 
     # shutdown请求
     def shutdown_request(self):
@@ -399,7 +446,16 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             user_data = json.loads(decoded)  # type: dict
 
             if self.ssh_client is None:
-                self.connect_terminal(user_data)
+                if "sftp" in user_data:
+                    """sftp"""
+                    self.connect(user_data)
+
+                else:
+                    """字符终端"""
+                    self.connect_terminal(user_data)
+
+            if not self.ssh_client.connected:
+                print("连接失败。。。")
                 return
             if 'size' in user_data:
 
@@ -418,27 +474,158 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
                     self.packet_write_wait(cmd)
 
             if 'sftp' in user_data:
+                print("user_data:", user_data)
                 """
-                    {
+                    action: {
                         chdir: '',
                         chmod: '',
                         chown: '',
                         file: '',
                         get: '',
+                        put: '',
                         listdir:
-                    }
+                    },
+                    packet: '',
+                    path: '',
+                    size: '',
+                    name: ''
                 """
-                pass
+                if not self.sftp_client:
+                    """初始化"""
+                    ssh = self.ssh_client.ssh  # type: paramiko.SSHClient
+                    sftp = paramiko.SFTPClient.from_transport(ssh.get_transport())
+                    self.sftp_client = SFTPClient(sftp)
+
+                sftp_json = user_data.get('sftp')  # type: dict
+                if sftp_json:
+
+                    if "put" in sftp_json:
+                        """上传文件"""
+                        self.response_log_message("开始上传 “{}”".format(sftp_json.get("name")))
+                        self.sftp_client.file_name = sftp_json.get("name")
+                        self.sftp_client.put_left_packet(
+                            packet=sftp_json.get("packet"),
+                            remote_path=sftp_json.get("put"),
+                            file_size=sftp_json.get("size"))
+
+                    elif "listdir" in sftp_json:
+                        """列出目录文件"""
+
+                        ret = []
+                        listdir = sftp_json.get("listdir", ".")
+                        if sftp_json.get("input", False):
+                            """判断是否在输入框中输入，还是直接点击目录"""
+                            self.response_command_log_message("cd {}".format(listdir))
+                        try:
+                            """改变当前的目录"""
+                            self.sftp_client.sftp.chdir(listdir)
+                        except FileNotFoundError:
+                            self.response_error_log_message("文件或目录 “{}” 不存在".format(listdir))
+                            self.response_error_log_message("读取目录列表失败")
+                            return
+
+                        """获取当前的工作目录"""
+                        cwd = self.sftp_client.sftp.getcwd()
+
+                        self.response_log_message("正在读取 “{}” 目录列表... ".format(cwd))
+                        listdir_attr = self.sftp_client.sftp.listdir_attr()
+                        self.response_log_message("正在列出目录 “{}”... ".format(cwd))
+
+                        for file in listdir_attr:
+                            ret.append({
+                                "longName": file.longname,
+                                "mode": file.st_mode & 0o170000,
+                                "name": file.filename,
+                                "modifyTime": file.st_mtime,
+                            })
+                        self.response_log_message("列出目录 “{}” 成功".format(cwd))
+
+                        sftp_message = {
+                            "data": ret,
+                            "type": "listdir",
+                            "sftp": 1,
+                            "cwd": self.sftp_client.sftp.getcwd()
+                        }
+
+                        self.send_message(sftp_message)
+
+                    elif "get" in sftp_json:
+                        """下载文件"""
+                        file_name = sftp_json.get("get", None)
+                        if not file_name:
+                            self.response_error_log_message("get “{}” ".format(file_name))
+                            return
+                        # 获取主机名
+                        # hostname = self.ssh_client.args["hostname"]
+                        # 文件远程路径
+                        remote_path = os.path.join(self.sftp_client.sftp.getcwd(), file_name)
+
+                        self.response_command_log_message("get “{}” => [BLOB](内存)".format(file_name))
+                        self.response_command_log_message("remote:{} => local:[BLOB](内存)".format(remote_path))
+
+                        def get_file_transform(data):
+                            payload = pack_message(data, OPCODE_BINARY)
+                            self.request.send(payload)
+
+                        def get_file_callback(transferred_bytes, current_transferred_bytes, file_size, consume_seconds):
+                            response_msg = {
+                                "sftp": 1,
+                                "type": "get",
+                                "path": remote_path,
+                                "name": file_name,
+                                "tx": transferred_bytes,
+                                "ctx": current_transferred_bytes,
+                                "file_size": file_size,
+                                "consume_seconds": "%d" % consume_seconds
+                            }
+                            self.send_message(response_msg)
+
+                        def finish_callback(cost_seconds, file_size):
+                            self.response_log_message("文件传输成功，传输了 %d 字节 (用时%d 秒)" % (file_size, cost_seconds))
+
+                        self.sftp_client.get(remote_path,
+                                             transform=get_file_transform,
+                                             # buffer_size=1024*1024,
+                                             callback=get_file_callback,
+                                             finish_callback=finish_callback)
 
         except ValueError:
             # 非JSON数据
             # 判断是否为心跳数据
             pass
 
-    # 连接到终端
-    def connect_terminal(self, message):
+    def response_command_log_message(self, msg, extra=None):
+        self.response_log_message(msg, -logging.INFO, "命令", extra)
 
+    def response_error_log_message(self, msg, extra=None):
+        self.response_log_message(msg, logging.ERROR, "错误", extra)
+
+    def response_log_message(self, msg: str, level: int = logging.INFO, title: str = "状态", extra=None):
         """
+        响应日志消息
+        :param extra:
+        :param title:
+        :param level:
+        :param msg:
+        :return:
+        """
+        sftp_message = {
+            "sftp": 1,
+            "type": "message",
+            "level": level,
+            "title": title,
+            "message": msg
+        }
+
+        if extra is not None:
+            for name in extra:
+                sftp_message[name] = extra.get(name)
+
+        self.send_message(json.dumps(sftp_message).encode())
+
+    def connect(self, message):
+        """
+        连接到终端
         :param message: dict
         """
         target = message.get('target')  # type: dict
@@ -453,9 +640,9 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
             if size is None:
                 size = {}
 
-            self.ssh_client = sshclient.SSHClient({
+            self.ssh_client = SSHClient({
                 'hostname': target.get('hostname'),
-                'port': target.get('port'),
+                'port': target.get('port', 22),
                 'username': target.get('username'),
                 'password': target.get('password'),
                 'width': size.get('w', 80),
@@ -463,25 +650,81 @@ class WebSocketServerRequestHandler(socketserver.BaseRequestHandler):
                 'term': message.get('term', 'vt100')
             })
 
+            if "sftp" in message:
+                self.response_log_message("正在连接 {}:{}... ".format(target.get('hostname'), target.get('port', 22)))
+
             # 连接失败？
             msg = self.ssh_client.connect()  # type: dict
             if msg is None:
                 # 发送版本及加密方式等的信息
-                self.queue.put(json.dumps(self.ssh_client.get_ssh_info()).encode(), block=queue_blocking)
-                self.reg_send()
+                resp = json.dumps(self.ssh_client.get_ssh_info()).encode()
+
+                if "sftp" in message:
+                    """返回连接状态"""
+                    sftp_message = {
+                        "sftp": 1,
+                        "type": "message",
+                        "level": logging.INFO,
+                        "title": "状态",
+                        "message": "已连接到 {}".format(target.get('hostname'))
+                    }
+                    resp += json.dumps(sftp_message).encode()
+
+                self.send_message(resp)
+
             else:
                 # 连接错误信息
-                self.queue.put(json.dumps(msg).encode(), block=queue_blocking)
-                self.reg_send()
+                self.send_message(msg)
                 return
 
-            self.ssh_client.new_terminal_shell()
-            # 开始心跳的时间
-            self.heartbeat_time = time.time()
-            # 注册ssh通道读取事件
-            self.selector.register(self.ssh_client.chan, selectors.EVENT_READ)
+    # 连接到终端
+    def connect_terminal(self, message):
+
+        self.connect(message)
+
+        self.ssh_client.new_terminal_shell()
+        # 开始心跳的时间
+        self.heartbeat_time = time.time()
+        # 注册ssh通道读取事件
+        self.selector.register(self.ssh_client.chan, selectors.EVENT_READ)
 
     # 请求结束
     # 释放资源
     def finish(self):
         self.shutdown_request()
+
+    # def read_next_message(self):
+    #     """读取消息"""
+    #     b1, b2 = self.rfile.read(2)
+    #     opcode = b1 & OPCODE
+    #     masked = b2 & MASKED
+    #     payload_length = b2 & PAYLOAD_LEN
+    #
+    #     if not b1:
+    #         logger.error("Client closed connection.")
+    #         self.keep_alive = False
+    #         return None, None
+    #     elif opcode == CLOSE_CONN:
+    #         logger.error("Client asked to close connection.")
+    #         self.keep_alive = False
+    #         return opcode, None
+    #     if not masked:
+    #         logger.error("Client must always be masked.")
+    #         self.keep_alive = False
+    #         return opcode, None
+    #
+    #     if payload_length == 126:
+    #         # (132,)
+    #         payload_length = struct.unpack('>H', self.rfile.read(2))[0]
+    #     elif payload_length == 127:
+    #         # (132,)
+    #         payload_length = struct.unpack('>Q', self.rfile.read(8))[0]
+    #
+    #     masks = self.rfile.read(4)
+    #
+    #     decoded = bytearray()
+    #     for c in self.rfile.read(payload_length):
+    #         c ^= masks[len(decoded) % 4]
+    #         decoded.append(c)
+    #
+    #     return opcode, decoded
