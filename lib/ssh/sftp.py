@@ -88,7 +88,7 @@ class SFTPClient:
 
     def get(self, remote_path: str,
             transform=None,
-            buffer_size=32768,
+            buffer_size=3276800,
             callback=None,
             finish_callback=None):
         """获取远程的文件"""

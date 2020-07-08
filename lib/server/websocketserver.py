@@ -1,4 +1,3 @@
-import os
 import socketserver
 import selectors
 import time
@@ -6,8 +5,13 @@ import json
 import paramiko
 import logging
 
+import os
+import sys
+
 from threading import Thread
 from logging.handlers import RotatingFileHandler
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + '/../')
+root_path = os.path.dirname(os.path.abspath(__file__)) + '/../../'
 
 from ..common.properties import Properties
 from ..common.handshake import handshake
@@ -29,13 +33,13 @@ shutdown_port = 8898
 
 # 128k
 socket_buffer_size = 131072
-channel_buffer_size = 131072
+channel_buffer_size = 524288
 # 队列是否阻塞，False：否，True：是
 queue_blocking = False
 
-access_log = "../logs/access.log"
-debug_log = "../logs/debug.log"
-error_log = "../logs/error.log"
+access_log = root_path + "logs/access.log"
+debug_log = root_path + "logs/debug.log"
+error_log = root_path + "logs/error.log"
 
 access_log_format = "%(remoteAddress)s - \"%(user)s\" - [%(asctime)s] - \"%(request)s\" " \
                     "- %(status)d - \"%(httpUserAgent)s\" - \"%(message)s\""
@@ -281,6 +285,8 @@ class WebSocketServerRequestHandler(socketserver.StreamRequestHandler):
             while not self.queue.empty():
                 message += self.queue.get_nowait()
             presentation = decode_utf8(message, flag='replace', replace_str='?')
+            print("presentation")
+            print(presentation.encode())
         else:
             if isinstance(data, dict):
                 presentation = json.dumps(data).encode()
@@ -369,7 +375,12 @@ class WebSocketServerRequestHandler(socketserver.StreamRequestHandler):
             self.reg_send()
 
             # 重新创建终端。
-            self.ssh_client.new_terminal_shell()
+            error_msg = self.ssh_client.new_terminal_shell()
+            if error_msg is not None:
+                self.queue.put(json.dumps(error_msg).encode('utf-8'), block=queue_blocking)
+                self.reg_send()
+                return
+
             # 重新注册ssh通道读取事件
             self.selector.register(self.ssh_client.chan, selectors.EVENT_READ)
             return
@@ -438,6 +449,11 @@ class WebSocketServerRequestHandler(socketserver.StreamRequestHandler):
 
             if decoded == '\x1b^hello!\x1b\\':
                 # 心跳
+                if not self.ssh_client.connected:
+                    # 发送date命令给服务器。
+                    self.finish()
+                    return
+
                 logger.debug("received heartbeat!")
                 self.queue.put(b'\x1b^3;hi!\x1b\\', block=queue_blocking)
                 self.reg_send()
@@ -682,7 +698,12 @@ class WebSocketServerRequestHandler(socketserver.StreamRequestHandler):
 
         self.connect(message)
 
-        self.ssh_client.new_terminal_shell()
+        error_msg = self.ssh_client.new_terminal_shell()
+        if error_msg is not None:
+            self.queue.put(json.dumps(error_msg).encode('utf-8'), block=queue_blocking)
+            self.reg_send()
+            return
+
         # 开始心跳的时间
         self.heartbeat_time = time.time()
         # 注册ssh通道读取事件

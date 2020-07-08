@@ -1,8 +1,10 @@
+import os
+import sys
 import socket
 import platform
-import sys
-from lib.server import websocketserver
 from threading import Thread
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + '/../')
+from lib.server import websocketserver
 
 shutdown_bind_address = "localhost"
 shutdown_port = 8898

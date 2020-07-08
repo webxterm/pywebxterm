@@ -95,6 +95,13 @@ class SSHClient:
     # 获取ssh通道
     def new_terminal_shell(self):
 
+        if self.ssh.get_transport() is None:
+            error_msg = {'status': 'fail',
+                         'e': 'Server Network not ready',
+                         'zh_msg': '服务器网络未就绪',
+                         'en_msg': 'Server Network not ready'}
+            return error_msg
+
         if self.ssh.get_transport().is_active() is False:
             # session不活跃
             # 需要重新连接
