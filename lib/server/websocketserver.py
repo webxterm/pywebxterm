@@ -10,6 +10,7 @@ import sys
 
 from threading import Thread
 from logging.handlers import RotatingFileHandler
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + '/../')
 root_path = os.path.dirname(os.path.abspath(__file__)) + '/../../'
 
@@ -175,7 +176,7 @@ class WebSocketServerRequestHandler(socketserver.StreamRequestHandler):
                 if not ip or ip == "unknown":
                     ip = sock.getpeername()[0]
 
-                logger.info('handshake success...', extra={
+                logger.info('handshake  success...', extra={
                     "remoteAddress": ip,
                     "user": "-",
                     "request": request,
@@ -285,8 +286,8 @@ class WebSocketServerRequestHandler(socketserver.StreamRequestHandler):
             while not self.queue.empty():
                 message += self.queue.get_nowait()
             presentation = decode_utf8(message, flag='replace', replace_str='?')
-            print("presentation")
-            print(presentation.encode())
+            # print("presentation")
+            # print(presentation.encode())
         else:
             if isinstance(data, dict):
                 presentation = json.dumps(data).encode()
